@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -35,10 +36,14 @@ except:
     FUSED_SSIM_AVAILABLE = False
 
 try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
+    #from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+def initialize_model_and_db(dataset, opt):
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    return Scene(dataset, gaussians), gaussians
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -57,11 +62,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    iter_t0 = 5000
+    iter_stability = 500
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    # Pesos de  las regularizaciones
+    wl, wh = 0.5, 0.5
+    # Será necesario hallar las frecuencias en el GT previamente
+    D0, D = 1, 180 
+    regularization_f_weight_init, regularization_f_weight_final = 0.2, 0.8
+
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    regularization_f_weight = get_expon_lr_func(regularization_f_weight_init, regularization_f_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -98,6 +112,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
+        # Extraemos una camara aleatoria del Stack
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
@@ -117,15 +132,59 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        
+        if iteration < iter_stability:
+            # Downsample the image to 1/4 of its size or Use Gaussian Splatting to reduce the high variance of frecuencies 
+            downsample_factor = 0.25 
+            gt_image = F.interpolate(gt_image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
+            image = F.interpolate(image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
+
+        # Get the Fourier Transformation from GT and the rednered image
+
+        gt_image_fft = torch.fft.fft2(gt_image)
+        image_fft = torch.fft.fft2(image)
+
+        # Definir las máscaras: para bajas frecuencias usamos D0
+        shape = gt_image.shape[-2:]  # (H, W)
+        device = gt_image.device
+
+        # Low pass filter 
+        mask_low = create_frequency_mask(shape, D0, high_pass=False, device=device)
+        
+
+        # Calculate the L1 loss and the SSIM loss
+
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
+        
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        # Frecuency Regularization
+        # Applying low pass filter
+        LF_gt = gt_image_fft * mask_low
+        LF_image = image_fft * mask_low
 
-        # Depth regularization
+        dla, dlp = compute_frequency_discrepancy(LF_gt, LF_image)
+        freq_loss = wl* (dla + dlp)
+
+        if iteration > iter_t0:
+            # D_t = ((iteration - T0) / (T_end - T0))*(D - D0) + D0
+            D_t = ((iteration - iter_t0) / (opt.iterations + 1 - iter_t0)) * (D - D0) + D0
+            mask_high = create_frequency_mask(shape, D_t, high_pass=True, device=device)
+            HF_gt = gt_image_fft * mask_high
+            HF_image = image_fft * mask_high
+            dha, dhp = compute_frequency_discrepancy(HF_gt, HF_image)
+            freq_loss += wh * (dha + dhp)
+
+        freq_loss = regularization_f_weight(iteration) * freq_loss
+
+        ##########################################################################################
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + freq_loss#
+        ##########################################################################################
+
+        # Depth regularization, ESTO NO ESTÁ EN EL PAPER
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
@@ -143,6 +202,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
+        # En esta sección no hay mapas de grafos computacionales para el calculo de gradientes (Eficiencia de mem GPU)
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -161,9 +221,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter: # Until the iteration 15000
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # Calculo del gradiente acumulado y aumento del denominador para aquellas gaussianas filtradas
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -251,6 +312,23 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+def create_frequency_mask(shape, cutoff, high_pass=False, device="cuda"):
+    H, W = shape
+    center_y, center_x = H // 2, W // 2
+    y = torch.arange(0, H, device=device).view(H, 1).expand(H, W)
+    x = torch.arange(0, W, device=device).view(1, W).expand(H, W)
+    dist = torch.sqrt((x - center_x).float()**2 + (y - center_y).float()**2)
+    if high_pass:
+        mask = (dist >= cutoff).float()
+    else:
+        mask = (dist <= cutoff).float()
+    return mask
+
+def compute_frequency_discrepancy(F_gt, F_render):
+    amp_diff = torch.abs(torch.abs(F_gt) - torch.abs(F_render))
+    phase_diff = torch.abs(torch.angle(F_gt) - torch.angle(F_render))
+    return amp_diff.mean(), phase_diff.mean()
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -279,6 +357,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    #training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
