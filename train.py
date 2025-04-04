@@ -70,7 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Pesos de  las regularizaciones
     wl, wh = 0.5, 0.5
     # Será necesario hallar las frecuencias en el GT previamente
-    D0, D = 1, 180 
+    D0, D = 0, 150 
     regularization_f_weight_init, regularization_f_weight_final = 0.2, 0.8
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
@@ -136,11 +136,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration < iter_stability:
             # Downsample the image to 1/4 of its size or Use Gaussian Splatting to reduce the high variance of frecuencies 
             downsample_factor = 0.25 
-            gt_image = F.interpolate(gt_image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
-            image = F.interpolate(image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
+            gt_image = gt_image.unsqueeze(0) 
+            image = image.unsqueeze(0)
+
+            gt_image_down = F.interpolate(gt_image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
+            image_down = F.interpolate(image, scale_factor=downsample_factor, mode='bilinear', align_corners=False)
+
+            gt_image = gt_image_down.squeeze(0)
+            image = image_down.squeeze(0)
 
         # Get the Fourier Transformation from GT and the rednered image
-
         gt_image_fft = torch.fft.fft2(gt_image)
         image_fft = torch.fft.fft2(image)
 
